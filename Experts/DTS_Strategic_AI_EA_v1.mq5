@@ -1,13 +1,12 @@
 
 #property strict
-#property version "1.20"
-#property description "DTS Strategic AI EA - Quantitative Signal and Risk Engine"
+#property version "1.30"
+#property description "DTS Strategic AI EA - Multi-Symbol Quant Engine"
 
 input string InpSymbols = "USTEC,XAUUSD";
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M5;
 
 input double InpRiskPercent = 0.5;
-
 input int InpFastEMA = 20;
 input int InpSlowEMA = 50;
 input int InpRSIPeriod = 14;
@@ -27,6 +26,13 @@ struct SymbolEngine
    int slowEMA;
    int rsi;
    int atr;
+   datetime lastBar;
+   string signal;
+   string reason;
+   int quality;
+   double spread;
+   double stopDistance;
+   double volume;
 };
 
 SymbolEngine engines[];
@@ -35,11 +41,10 @@ int OnInit()
 {
    if(InpRiskPercent <= 0 ||
       InpRiskPercent > 0.5 ||
-      InpMaxSpreadPoints <= 0)
-   {
-      Print("Invalid risk or spread configuration.");
+      InpMaxSpreadPoints <= 0 ||
+      InpFastEMA <= 0 ||
+      InpSlowEMA <= InpFastEMA)
       return INIT_PARAMETERS_INCORRECT;
-   }
 
    string symbols[];
    int count = StringSplit(InpSymbols, ',', symbols);
@@ -55,6 +60,10 @@ int OnInit()
       StringTrimRight(symbols[i]);
 
       engines[i].symbol = symbols[i];
+      engines[i].lastBar = 0;
+      engines[i].signal = "INITIALIZING";
+      engines[i].reason = "Waiting for data";
+      engines[i].quality = 0;
 
       if(!SymbolSelect(symbols[i], true))
       {
@@ -75,7 +84,8 @@ int OnInit()
          InpRSIPeriod, PRICE_CLOSE);
 
       engines[i].atr = iATR(
-         symbols[i], InpTimeframe, InpATRPeriod);
+         symbols[i], InpTimeframe,
+         InpATRPeriod);
 
       if(engines[i].fastEMA == INVALID_HANDLE ||
          engines[i].slowEMA == INVALID_HANDLE ||
@@ -88,8 +98,8 @@ int OnInit()
       }
    }
 
-   Print("DTS Strategic AI EA v1.20 initialized.");
-   Print("Signal generation only. Execution disabled.");
+   Print("DTS v1.30 multi-symbol engine initialized.");
+   Print("Automatic execution remains disabled.");
 
    return INIT_SUCCEEDED;
 }
@@ -131,6 +141,12 @@ double GetSpreadPoints(string symbol)
    return (ask - bid) / point;
 }
 
+double CalculateRiskMoney()
+{
+   return AccountInfoDouble(ACCOUNT_EQUITY)
+          * InpRiskPercent / 100.0;
+}
+
 double CalculateStopDistance(int index)
 {
    double atr;
@@ -139,13 +155,6 @@ double CalculateStopDistance(int index)
       return 0.0;
 
    return atr * InpStopATRMultiplier;
-}
-
-double CalculateRiskMoney()
-{
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-
-   return equity * InpRiskPercent / 100.0;
 }
 
 double CalculateVolume(string symbol, double stopDistance)
@@ -173,13 +182,12 @@ double CalculateVolume(string symbol, double stopDistance)
       return 0.0;
 
    double lossPerLot =
-      (stopDistance / tickSize) * tickValue;
+      stopDistance / tickSize * tickValue;
 
    if(lossPerLot <= 0)
       return 0.0;
 
-   double rawVolume =
-      CalculateRiskMoney() / lossPerLot;
+   double rawVolume = CalculateRiskMoney() / lossPerLot;
 
    double volume =
       MathFloor(rawVolume / volumeStep) * volumeStep;
@@ -194,128 +202,111 @@ double CalculateVolume(string symbol, double stopDistance)
    return NormalizeDouble(volume, 8);
 }
 
-string GenerateSignal(
-   int index,
-   int &quality,
-   string &reason)
+bool UpdateSymbol(int index)
 {
-   double fast, slow, rsi, atr;
+   string symbol = engines[index].symbol;
 
-   quality = 0;
-   reason = "";
+   datetime currentBar =
+      iTime(symbol, InpTimeframe, 0);
+
+   if(currentBar <= 0)
+      return false;
+
+   if(currentBar == engines[index].lastBar)
+      return true;
+
+   engines[index].lastBar = currentBar;
+
+   double spread = GetSpreadPoints(symbol);
+   engines[index].spread = spread;
+
+   if(spread < 0)
+   {
+      engines[index].signal = "DATA ERROR";
+      engines[index].reason = "Spread unavailable";
+      return false;
+   }
+
+   if(spread > InpMaxSpreadPoints)
+   {
+      engines[index].signal = "REJECTED";
+      engines[index].reason = "High spread";
+      engines[index].quality = 0;
+      return true;
+   }
+
+   double fast, slow, rsi, atr;
 
    if(!ReadIndicator(engines[index].fastEMA, fast) ||
       !ReadIndicator(engines[index].slowEMA, slow) ||
       !ReadIndicator(engines[index].rsi, rsi) ||
       !ReadIndicator(engines[index].atr, atr))
    {
-      reason = "Indicator data unavailable";
-      return "WAITING FOR DATA";
+      engines[index].signal = "WAITING";
+      engines[index].reason = "Indicator data unavailable";
+      engines[index].quality = 0;
+      return false;
    }
 
    if(atr <= 0)
    {
-      reason = "Invalid ATR";
-      return "WAITING";
+      engines[index].signal = "WAITING";
+      engines[index].reason = "Invalid ATR";
+      engines[index].quality = 0;
+      return false;
    }
 
-   quality++;
+   engines[index].quality = 1;
 
-   bool bullishTrend = fast > slow;
-   bool bearishTrend = fast < slow;
-
-   if(bullishTrend)
+   if(fast > slow && rsi >= InpBullishRSI)
    {
-      quality++;
-
-      if(rsi >= InpBullishRSI)
-      {
-         quality++;
-         reason = "Bullish conditions confirmed";
-         return "BULLISH";
-      }
-
-      reason = "Bullish trend, RSI not confirmed";
-      return "NEUTRAL";
+      engines[index].signal = "BULLISH";
+      engines[index].reason = "EMA and RSI confirmed";
+      engines[index].quality = 3;
    }
-
-   if(bearishTrend)
+   else if(fast < slow && rsi <= InpBearishRSI)
    {
-      quality++;
-
-      if(rsi <= InpBearishRSI)
-      {
-         quality++;
-         reason = "Bearish conditions confirmed";
-         return "BEARISH";
-      }
-
-      reason = "Bearish trend, RSI not confirmed";
-      return "NEUTRAL";
+      engines[index].signal = "BEARISH";
+      engines[index].reason = "EMA and RSI confirmed";
+      engines[index].quality = 3;
+   }
+   else
+   {
+      engines[index].signal = "NEUTRAL";
+      engines[index].reason = "Conditions not aligned";
    }
 
-   reason = "EMA trend not established";
-   return "NEUTRAL";
+   engines[index].stopDistance =
+      atr * InpStopATRMultiplier;
+
+   engines[index].volume =
+      CalculateVolume(symbol, engines[index].stopDistance);
+
+   return true;
 }
 
 void OnTick()
 {
-   string dashboard =
-      "DTS STRATEGIC AI EA v1.20\n";
-
-   dashboard += "QUANTITATIVE SIGNAL ENGINE\n";
-   dashboard += "AUTOMATIC EXECUTION: OFF\n";
+   string dashboard = "DTS STRATEGIC AI EA v1.30\n";
+   dashboard += "MULTI-SYMBOL MONITOR\n";
+   dashboard += "EXECUTION: DISABLED\n";
    dashboard += "RISK SETTING: 0.5%\n\n";
 
    for(int i = 0; i < ArraySize(engines); i++)
    {
-      string symbol = engines[i].symbol;
+      UpdateSymbol(i);
 
-      double spread = GetSpreadPoints(symbol);
-
-      dashboard += symbol + "\n";
-
-      if(spread < 0)
-      {
-         dashboard += "Spread: UNAVAILABLE\n";
-         dashboard += "Status: DATA ERROR\n\n";
-         continue;
-      }
-
-      dashboard += "Spread: " +
-         DoubleToString(spread, 1) + " points\n";
-
-      if(spread > InpMaxSpreadPoints)
-      {
-         dashboard += "Signal: REJECTED\n";
-         dashboard += "Reason: High spread\n\n";
-         continue;
-      }
-
-      int quality = 0;
-      string reason;
-
-      string signal =
-         GenerateSignal(i, quality, reason);
-
-      double stopDistance =
-         CalculateStopDistance(i);
-
-      double volume =
-         CalculateVolume(symbol, stopDistance);
-
-      dashboard += "Signal: " + signal + "\n";
-
+      dashboard += engines[i].symbol + "\n";
+      dashboard += "Signal: " + engines[i].signal + "\n";
       dashboard += "Quality: " +
-         IntegerToString(quality) + "/3\n";
-
-      dashboard += "Reason: " + reason + "\n";
-
+         IntegerToString(engines[i].quality) + "/3\n";
+      dashboard += "Spread: " +
+         DoubleToString(engines[i].spread, 1) + "\n";
+      dashboard += "Reason: " + engines[i].reason + "\n";
       dashboard += "Stop distance: " +
-         DoubleToString(stopDistance, 5) + "\n";
-
+         DoubleToString(engines[i].stopDistance, 5) + "\n";
       dashboard += "Estimated volume: " +
-         DoubleToString(volume, 2) + "\n\n";
+         DoubleToString(engines[i].volume, 2) + "\n\n";
    }
 
    Comment(dashboard);
